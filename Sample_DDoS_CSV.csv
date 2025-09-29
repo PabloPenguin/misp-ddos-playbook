@@ -1,0 +1,5 @@
+ip,port,asn,comment
+198.51.100.45,80,AS64500,Attacker IP observed in UDP flood
+198.51.100.23,443,AS64501,Secondary attacker from vendor feed
+203.0.113.0/24,0,AS64510,Victim subnet targeted (finance sector)
+192.0.2.55,53,AS64520,Open DNS resolver used for amplification
