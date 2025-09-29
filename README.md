@@ -1,222 +1,180 @@
-# 🚨 MISP DDoS Playbook
+# DDoS Playbook CLI for MISP ⚔️🛰️
 
-A practical script and playbook for detecting and mitigating potential DDoS activity, with optional reporting to a MISP (Malware Information Sharing Platform) instance.
-
-> Replace any `<<PLACEHOLDER>>` text with values from your actual script or environment.
-
----
-
-## 📌 Quick summary
-- **Script filename:** `<<ddos_playbook.sh or script filename>>`  
-- **Purpose:** Detect suspicious traffic, apply mitigation rules (iptables/nft), log incidents, and optionally report to MISP.  
-- **Author:** `<<Your name / team>>`  
-- **License:** MIT
+A compact, production-minded CLI script to create/update MISP events for DDoS incidents, import bulk indicators (CSV → **MISP objects**), and automatically apply playbook tags (TLP, Admiralty scale, ATT&CK, sector, …).  
+This repo contains `ddos_playbook_cli.py` — an interactive **and** non-interactive tool for analysts and automation pipelines.
 
 ---
 
-## ⚙️ Prerequisites
-Ensure the host running the script meets these prerequisites:
-
-- Operating System: Linux (tested on Ubuntu/CentOS)  
-- Privileges: `sudo` (required to apply firewall rules)  
-- Tools (install as needed): `iptables` or `nft`, `ss`/`netstat`, `curl`, `jq` (if using JSON), `logger`  
-- Network: Access to MISP URL if reporting enabled  
-- Environment variables (if used by script):
-  - `MISP_URL=<<https://misp.example/api>>`
-  - `MISP_KEY=<<your_misp_api_key>>`
-  - `LOG_PATH=<</var/log/misp-ddos.log>>`
-
-> Tip: Test in a staging environment before deploying to production.
-
----
-
-## 📁 Repository layout
-```
-misp-ddos-playbook/
-  ├── <<ddos_playbook.sh>>      # Main script (replace placeholder)
-  ├── config.example.yml        # Example config (if present)
-  ├── misp-ddos-log.txt         # Example/created log file
-  └── README.md                 # This file
-```
+## 🚀 Features (TL;DR)
+- Create **new** MISP events or update **existing** ones (interactive or via CLI flags).
+- Import CSV rows into structured **MISP objects** (default template `ip-port`) — maps columns like `ip`, `port`, `asn`, `comment`.
+- Apply playbook tags automatically:
+  - `tlp:*`, `information-security-indicators:incident-type="ddos"`, `misp-event-type:incident`
+  - MITRE ATT&CK DDoS tags (e.g., `T1498`, `T1498.001`)
+  - Admiralty scale (event-level and optional attribute/object-level)
+  - Sector tag (e.g., `sector:finance`)
+- Duplicate-check per-event for IPs (prevents repeated attributes).
+- Interactive wizard to manually add DDoS objects (one-off analyst entry).
+- Non-interactive mode for automation (all inputs as flags).
+- `.env` support for `MISP_URL` / `MISP_KEY` (via `python-dotenv`).
 
 ---
 
-## 🚀 Installation
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/<<yourusername>>/misp-ddos-playbook.git
-   cd misp-ddos-playbook
-   ```
-2. Make the script executable:
-   ```bash
-   chmod +x <<ddos_playbook.sh>>
-   ```
-3. Configure:
-   - If provided, copy and edit `config.example.yml`:
-     ```bash
-     cp config.example.yml config.yml
-     # Edit config.yml with MISP URL, API key, thresholds, and paths
-     ```
+## 🧰 Requirements
+- Python 3.8+
+- Packages:
+  ```bash
+  pip install pymisp python-dotenv requests
+  ```
+- A MISP account with an API Key (Administration → List Auth Keys) and permissions to create/publish events.
 
 ---
 
-## 🧭 How the script works (overview)
-1. **Collects traffic stats** — uses `ss`/`netstat` or `/proc/net/dev` to measure connection/load metrics.  
-2. **Detects anomalies** — compares metrics against thresholds (connections/sec, unique IPs, SYN rate, etc.).  
-   Example thresholds (replace with your script's values):
-   - `CONNS_PER_SEC_THRESHOLD = <<e.g., 1000>>`
-   - `UNIQUE_IP_THRESHOLD    = <<e.g., 300>>`
-3. **Mitigates** — applies firewall rules (iptables or nft) to block offending IP addresses or ranges.  
-4. **Logs** — writes incident details (timestamp, IP, metric, action) to `LOG_PATH` or `misp-ddos-log.txt`.  
-5. **Reports (optional)** — sends event/attribute to MISP via its REST API using `MISP_KEY` if enabled.
+## 📦 Files in repo
+- `ddos_playbook_cli.py` — main script
+- `mapping.example.json` — example CSV→object attribute mapping (optional)
+- `sample_ddos.csv` — sample CSV (ip,port,asn,comment)
+- `.gitignore` — recommended to exclude `.env`, `__pycache__`, etc.
+- `README.md` (this file)
 
 ---
 
-## 🧰 Usage examples
+## 🔧 Setup
 
-### Basic interactive run
+### 1) Clone & create venv
 ```bash
-sudo ./<<ddos_playbook.sh>>
+git clone https://github.com/PabloPenguin/misp-ddos-playbook.git
+cd misp-ddos-playbook
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
+pip install --upgrade pip
+# EITHER:
+pip install -r requirements.txt
+# OR:
+pip install pymisp python-dotenv requests
 ```
 
-### Dry run (show actions but do not apply rules — replace with your script flags)
+### 2) Create `.env` (do **not** commit)
+Create a `.env` in the repo root (this file **must not** be committed — it should be listed in `.gitignore`):
+
+```env
+MISP_URL=https://server1.tailaa85d9.ts.net
+MISP_KEY=YOUR_API_KEY_GOES_HERE
+MISP_VERIFY_SSL=false   # set true if your MISP certificate is CA-signed
+```
+
+---
+
+## 🧭 Quick Usage
+
+### Interactive mode (recommended for analysts)
 ```bash
-sudo ./<<ddos_playbook.sh>> --dry-run
+python ddos_playbook_cli.py
 ```
+This will:
+1. Prompt to **create new** or **update existing** event.
+2. Prompt for event metadata (title/info, date, threat level, analysis).
+3. Ask whether you want to **add DDoS objects**:
+   - `csv` → import rows from a CSV file
+   - `manual` → enter IP / port / ASN interactively
 
-### Automatic mitigation mode (replace flags with actual script options)
+### Non-interactive mode (automation)
 ```bash
-sudo ./<<ddos_playbook.sh>> --mode auto --thresholds config.yml
+python ddos_playbook_cli.py   --non-interactive   --new-event   --info "DDoS Campaign - automated import"   --date 2025-09-29   --threat-level 1   --analysis 0   --distribution 1   --csv sample_ddos.csv   --object ip-port   --mapping mapping.example.json   --tags "tlp:amber" "sector:finance"   --attr-admiralty   --publish
 ```
 
-### Sample output (example only)
+> If you have `.env` configured, you can omit `--url`/`--key`.
+
+---
+
+## 🗂 CSV format & mapping
+
+### Example CSV (`sample_ddos.csv`)
+```csv
+ip,port,asn,comment
+192.0.2.10,80,64500,"Botnet C2 server"
+198.51.100.25,443,64501,"Amplification node"
+203.0.113.50,53,64502,"Open resolver"
 ```
-[INFO] Checking network stats...
-[ALERT] High connection rate from 203.0.113.45 (1200 conn/s)
-[ACTION] Blocking IP 203.0.113.45 via iptables
-[INFO] Logged incident to /var/log/misp-ddos.log
-[INFO] Reported event to MISP: https://misp.example/events/view/123
+
+### Default mapping (used if no `--mapping` is supplied)
+```json
+{
+  "ip": "ip",
+  "port": "port",
+  "asn": "asn",
+  "comment": "comment"
+}
+```
+
+You may pass a JSON mapping file with `--mapping mapping.json` to map your CSV columns to object attributes.  
+Each **row** becomes one **MISP Object** (default `ip-port`) with attributes populated from the mapping.
+
+---
+
+## 🏷️ Tagging & Playbook defaults
+When creating/updating events, the script auto-applies:
+- `tlp:green` (default TLP)
+- `information-security-indicators:incident-type="ddos"`
+- `misp-event-type:incident`
+- MITRE ATT&CK DDoS (`T1498`, `T1498.001`)
+- `sector:finance` (change or remove via `--tags`)
+
+**Admiralty defaults**
+- Event-level: `admiralty-scale:source-reliability=B`, `admiralty-scale:information-credibility=2`
+- Attribute/object-level Admiralty tags: enable with `--attr-admiralty` (customize with `--attr-admiralty-src` and `--attr-admiralty-info`)
+
+You can add or override tags with `--tags` (space-separated list), e.g.:
+```bash
+--tags "tlp:amber" "admiralty-scale:source-reliability=A"
 ```
 
 ---
 
-## 🔧 Configuration options
-Replace these with the exact options and defaults used by your script:
-
-- `--dry-run`         : Analyze and display actions without applying firewall changes  
-- `--auto` / `--manual`: Mitigation mode — automatic blocking versus manual confirm  
-- `--thresholds FILE` : Load threshold values from a YAML or JSON file  
-- `LOG_PATH`          : Path to incident log (default: `./misp-ddos-log.txt`)  
-- `MISP_URL` / `MISP_KEY`: Required only if MISP reporting enabled
+## 🔁 Duplicate handling
+- Prevents re-adding the same IPs within one event (checks both `ip-dst` and `ip-src`).
+- Skipped duplicates are reported during CSV import.
 
 ---
 
-## 🛠️ Mitigation customization
-To adjust behavior, edit the mitigation section of `<<ddos_playbook.sh>>` (or `config.yml`):
+## 🔒 Security & Best Practices
+- **Never commit `.env` or secrets.**
+- Respect TLP/PAP before sharing events externally.
+- For production, use SSL verification (`MISP_VERIFY_SSL=true`) and run in a secured environment.
+- Limit API keys to least-privilege roles required for your workflow.
 
-- Switch firewall backend: `iptables` → `nft`  
-- Replace hard IP blocks with rate limits (example iptables rule):
+---
+
+## 🧩 Development & Contribution
+- Use branches:  
   ```bash
-  iptables -A INPUT -p tcp --dport 80 -m connlimit --connlimit-above 200 -j DROP
+  git checkout -b feature/new-thing
   ```
-- Add whitelists for trusted IPs or networks  
-- Implement block duration and automated unblock logic
-
----
-
-## 🧾 Logging & retention
-- Log format: `timestamp, offending IP, metric detected, action taken, optional MISP event ID`  
-- Example log file: `/var/log/misp-ddos.log`  
-- Use `logrotate` to keep logs manageable. Example `logrotate` snippet:
-  ```
-  /var/log/misp-ddos.log {
-      daily
-      rotate 7
-      compress
-      missingok
-      notifempty
-  }
-  ```
-
----
-
-## ✅ Testing & validation
-- Use `--dry-run` to verify detection logic without making changes.  
-- Simulate traffic in an isolated environment with tools such as `hping3` or `wrk`.  
-- Validate firewall state after an applied change:
+- Stage/commit/push changes:
   ```bash
-  sudo iptables -L -n -v
-  # or
-  sudo nft list ruleset
+  git add .
+  git commit -m "Describe change"
+  git push -u origin feature/new-thing
   ```
+- PRs welcome with examples and test cases.
 
 ---
 
-## ❗ Troubleshooting
-- **Permission errors** — Ensure the script is executed with `sudo` or root.  
-- **MISP reporting fails** — Confirm `MISP_URL` and `MISP_KEY` are correct and network connectivity to MISP exists.  
-- **Firewall rules not applied** — Confirm `iptables`/`nft` is installed and kernel modules are available; check script error logs.  
-- **False positives** — Adjust thresholds in `config.yml` and retest in dry-run mode.
+## 💡 Examples
+
+**Interactive new event**
+```bash
+python ddos_playbook_cli.py
+```
+
+**Non-interactive + CSV import**
+```bash
+python ddos_playbook_cli.py --non-interactive --new-event --info "DDoS September"   --date 2025-09-29 --csv sample_ddos.csv --tags tlp:amber --publish
+```
 
 ---
 
-## ↩️ Reverting mitigation (undoing blocks)
-- For iptables (example removing by rule spec):
-  ```bash
-  sudo iptables -D INPUT <line-number-or-rule-spec>
-  ```
-- If the script provides an unblock option:
-  ```bash
-  sudo ./<<ddos_playbook.sh>> --unblock 203.0.113.45
-  ```
-- Keep a record of added rules (timestamped) so they can be quickly reversed if needed.
-
----
-
-## 📦 Deployment recommendations
-- Run the script from a hardened management host with restricted access.  
-- For active protection, consider integrating with a dedicated mitigation appliance or upstream filter (ISP/cloud provider).  
-- For passive monitoring, run as a scheduled cron job that reports but does not block automatically.  
-- Integrate with your SIEM by writing logs to syslog or forwarding alerts via webhook.
-
----
-
-## ⚖️ Safety and responsibility
-This script can modify firewall rules and disrupt traffic. Always:
-- Test thoroughly in a controlled environment before production use.  
-- Keep whitelist and emergency access methods in place.  
-- Document any automated mitigation so on-call staff understand actions taken.
-
----
-
-## 🧑‍💻 Contributing
-1. Fork the repository.  
-2. Create a branch:
-   ```bash
-   git checkout -b feature/your-change
-   ```
-3. Commit changes and push.  
-4. Open a Pull Request with a clear summary of modifications.
-
----
-
-## 📝 Changelog
-- `v0.1` — Initial template and basic detection/mitigation flow  
-- `v0.2` — Example MISP reporting included
-
----
-
-## 📬 Contact
-For questions or support: `<<your-email@example.com or team alias>>`
-
----
-
-## ✅ Placeholders to fill (summary)
-- `<<ddos_playbook.sh or script filename>>`  — actual script name  
-- `<<yourusername>>`                        — GitHub username or org  
-- `<<MISP_URL_IF_USED>>`                    — MISP URL if reporting enabled  
-- `<<your_misp_api_key>>`                   — MISP API key  
-- `<<LOG_PATH or misp-ddos-log.txt>>`       — final log path  
-- Exact CLI flags and behavior from your script (e.g. `--dry-run`, `--mode`, `--unblock`)
+## 📄 LICENSE
+MIT License (or your choice).
 
 ---
