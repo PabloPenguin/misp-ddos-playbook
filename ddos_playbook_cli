@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+# ddos_playbook_cli.py
+# DDoS Playbook CLI for MISP - interactive + non-interactive
+# Requirements: pip install pymisp python-dotenv requests
+
+import os
+import sys
+import csv
+import json
+import argparse
+from datetime import datetime
+from getpass import getpass
+from typing import Dict, List, Optional
+
+from pymisp import ExpandedPyMISP, MISPEvent, MISPObject
+
+# ------------- Defaults - adjust as needed -------------
+DEFAULT_ATTACK_TAGS = ["mitre-attack-pattern:T1498", "mitre-attack-pattern:T1498.001"]
+DEFAULT_TLP = "tlp:green"
+DEFAULT_INCIDENT = 'information-security-indicators:incident-type="ddos"'
+DEFAULT_EVENTTYPE = "misp-event-type:incident"
+DEFAULT_SECTOR = "sector:finance"
+DEFAULT_ADMIRALTY_SRC = "B"
+DEFAULT_ADMIRALTY_INFO = "2"
+DEFAULT_ATTR_ADMIRALTY_SRC = "C"
+DEFAULT_ATTR_ADMIRALTY_INFO = "4"
+DEFAULT_OBJECT_TEMPLATE = "ip-port"
+DEFAULT_MAPPING = {"ip": "ip", "port": "port", "asn": "asn", "comment": "comment"}
+# -------------------------------------------------------
+
+def init_misp(url: str, key: str, verify: bool) -> ExpandedPyMISP:
+    return ExpandedPyMISP(url, key, ssl=verify)
+
+def prompt(msg: str, default: Optional[str] = None, required: bool = False) -> str:
+    while True:
+        p = input(f"{msg}{(' ['+default+']' if default else '')}: ").strip()
+        if not p and default is not None:
+            p = default
+        if required and not p:
+            print("  -> required")
+            continue
+        return p
+
+def bool_prompt(msg: str, default: bool = True) -> bool:
+    d = "Y/n" if default else "y/N"
+    r = input(f"{msg} [{d}]: ").strip().lower()
+    if r == "":
+        return default
+    return r in ("y", "yes", "y", "1", "true")
+
+def load_mapping(mapping_file: Optional[str]) -> Dict[str,str]:
+    if mapping_file:
+        if not os.path.exists(mapping_file):
+            raise FileNotFoundError(f"Mapping file not found: {mapping_file}")
+        with open(mapping_file) as fh:
+            return json.load(fh)
+    return DEFAULT_MAPPING.copy()
+
+def create_event_interactive(misp: ExpandedPyMISP) -> dict:
+    print("Creating new event (interactive)...")
+    info = prompt("Event title/info", default="DDoS campaign")
+    date = prompt("Event date (YYYY-MM-DD)", default=datetime.utcnow().strftime("%Y-%m-%d"))
+    thr = int(prompt("Threat level id (1=High,2=Medium,3=Low,4=Undefined)", default="1"))
+    analysis = int(prompt("Analysis (0=Initial,1=Ongoing,2=Completed)", default="0"))
+    distribution = int(prompt("Distribution (0=Your org,1=this community,2=connected,3=all)", default="1"))
+    ev = misp.add_event({
+        "info": info,
+        "date": date,
+        "threat_level_id": thr,
+        "analysis": analysis,
+        "distribution": distribution,
+        "published": False
+    })
+    if not ev or "Event" not in ev:
+        raise RuntimeError("Failed to create event")
+    print(f"Created event id {ev['Event']['id']}")
+    return ev["Event"]
+
+def create_event_noninteractive(misp: ExpandedPyMISP, info: str, date: str, threat_level: int, analysis: int, distribution: int) -> dict:
+    ev = misp.add_event({
+        "info": info,
+        "date": date,
+        "threat_level_id": threat_level,
+        "analysis": analysis,
+        "distribution": distribution,
+        "published": False
+    })
+    if not ev or "Event" not in ev:
+        raise RuntimeError("Failed to create event")
+    return ev["Event"]
+
+def get_existing_event(misp: ExpandedPyMISP, event_id_or_uuid: str) -> dict:
+    # Accept numeric id or uuid
+    try:
+        if event_id_or_uuid.isdigit():
+            ev = misp.get(int(event_id_or_uuid))
+            return ev.get("Event")
+    except Exception:
+        pass
+    # fallback uuid
+    ev = misp.get(event_id_or_uuid)
+    if ev and "Event" in ev:
+        return ev["Event"]
+    raise RuntimeError("Event not found")
+
+def apply_event_tags(misp: ExpandedPyMISP, event_uuid: str, tags: List[str]):
+    for t in tags:
+        try:
+            misp.tag(event_uuid, t)
+        except Exception as e:
+            print(f"Warning applying tag {t}: {e}")
+
+def read_csv_rows(csv_path: str) -> List[Dict[str,str]]:
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(csv_path)
+    with open(csv_path, newline='') as fh:
+        reader = csv.DictReader(fh)
+        return [row for row in reader]
+
+def add_object_from_row(misp: ExpandedPyMISP, event_uuid: str, template: str, mapping: Dict[str,str], row: Dict[str,str]) -> Optional[dict]:
+    obj = MISPObject(template)
+    for col, attr in mapping.items():
+        val = row.get(col) or row.get(col.lower()) or row.get(col.upper())
+        if val:
+            obj.add_attribute(attr, val)
+    comment = None
+    # set comment if mapped
+    comment_field = None
+    for k,v in mapping.items():
+        if v == "comment":
+            comment_field = k
+            break
+    if comment_field:
+        comment = row.get(comment_field)
+        if comment:
+            obj.comment = comment
+    try:
+        added = misp.add_object(event_uuid, obj)
+        return added
+    except Exception as e:
+        print(f"Failed to add object for row {row}: {e}")
+        return None
+
+def attribute_exists_in_event(misp: ExpandedPyMISP, event_id: int, value: str, attr_type: str="ip-dst") -> bool:
+    # search attributes by value and eventid
+    try:
+        res = misp.search(controller='attributes', eventid=event_id, value=value, type_attribute=attr_type, limit=1)
+        return bool(res)
+    except Exception:
+        return False
+
+def apply_tags_to_object(misp: ExpandedPyMISP, obj_dict: dict, tags: List[str]):
+    # obj_dict has 'Object' with 'uuid'
+    if not obj_dict or "Object" not in obj_dict:
+        return
+    uuid = obj_dict["Object"]["uuid"]
+    for t in tags:
+        try:
+            misp.tag(uuid, t)
+        except Exception as e:
+            print(f"Warning tagging object {uuid} with {t}: {e}")
+
+def main():
+    # CLI args
+    ap = argparse.ArgumentParser(description="DDoS Playbook CLI for MISP (interactive + non-interactive)")
+    # connection
+    ap.add_argument("--url", help="MISP URL (or set MISP_URL env/.env)")
+    ap.add_argument("--key", help="MISP API key (or set MISP_KEY env/.env)")
+    ap.add_argument("--verify", action="store_true", help="Verify SSL certs (default false)")
+    # event control
+    group = ap.add_mutually_exclusive_group()
+    group.add_argument("--new-event", action="store_true", help="Create new event (interactive unless flags provided)")
+    group.add_argument("--event-id", help="Use existing event ID or UUID")
+    # non-interactive event params
+    ap.add_argument("--info", help="Event info/title (non-interactive)")
+    ap.add_argument("--date", help="Event date YYYY-MM-DD (non-interactive)")
+    ap.add_argument("--threat-level", type=int, default=2, help="Threat level id (non-interactive)")
+    ap.add_argument("--analysis", type=int, default=0, help="Analysis level (non-interactive)")
+    ap.add_argument("--distribution", type=int, default=1, help="Distribution (non-interactive)")
+    # csv/object import & mapping
+    ap.add_argument("--csv", help="Path to CSV file to import (rows -> objects)")
+    ap.add_argument("--object", default=DEFAULT_OBJECT_TEMPLATE, help="MISP object template name (default ip-port)")
+    ap.add_argument("--mapping", help="JSON mapping file (column->object-attribute). Default maps ip->ip,port->port,asn->asn,comment->comment")
+    # tagging / admiralty
+    ap.add_argument("--tags", nargs="+", help="Additional tags to apply to each object (e.g. tlp:amber admiralty-scale:source-reliability=B)")
+    ap.add_argument("--admiralty-src", help="Event-level admiralty source reliability (A-E)", default=DEFAULT_ADMIRALTY_SRC)
+    ap.add_argument("--admiralty-info", help="Event-level admiralty information credibility (1-6)", default=DEFAULT_ADMIRALTY_INFO)
+    ap.add_argument("--attr-admiralty", action="store_true", help="Apply attribute/object-level admiralty defaults to imported objects")
+    ap.add_argument("--attr-admiralty-src", help="Attribute-level admiralty source reliability default", default=DEFAULT_ATTR_ADMIRALTY_SRC)
+    ap.add_argument("--attr-admiralty-info", help="Attribute-level admiralty information credibility default", default=DEFAULT_ATTR_ADMIRALTY_INFO)
+    # publishing & non-interactive mode
+    ap.add_argument("--publish", action="store_true", help="Publish the event after import")
+    ap.add_argument("--non-interactive", action="store_true", help="Run fully non-interactive (requires flags for creation and csv)")
+    args = ap.parse_args()
+
+    # load env fallback
+    from dotenv import load_dotenv
+    load_dotenv()
+    misp_url = args.url or os.getenv("MISP_URL")
+    misp_key = args.key or os.getenv("MISP_KEY")
+    if not misp_url:
+        misp_url = prompt("MISP URL (e.g. https://misp.example)", required=True)
+    if not misp_key:
+        misp_key = getpass("MISP API key: ")
+
+    misp = init_misp(misp_url, misp_key, verify=args.verify)
+
+    # Determine event
+    event_obj = None
+    if args.event_id:
+        event_obj = get_existing_event(misp, args.event_id)
+    elif args.new_event:
+        # If non-interactive, require info/date etc
+        if args.non_interactive:
+            if not args.info or not args.date:
+                print("In non-interactive mode --new-event requires --info and --date")
+                sys.exit(2)
+            event_obj = create_event_noninteractive(misp, args.info, args.date, args.threat_level, args.analysis, args.distribution)
+        else:
+            # interactive creation
+            event_obj = create_event_interactive(misp)
+    else:
+        # If not specified, interactive prompt to choose create or use existing
+        if args.non_interactive:
+            print("In non-interactive mode you must specify --new-event or --event-id")
+            sys.exit(2)
+        choice = prompt("Create new event or update existing? (new/existing)", default="new")
+        if choice == "existing":
+            eid = prompt("Enter existing Event ID or UUID", required=True)
+            event_obj = get_existing_event(misp, eid)
+        else:
+            event_obj = create_event_interactive(misp)
+
+    event_id = int(event_obj["id"])
+    event_uuid = event_obj["uuid"]
+    print(f"Operating on event {event_id} ({event_uuid})")
+
+    # Build event-level tags (playbook)
+    auto_tags = []
+    tlp_tag = DEFAULT_TLP
+    incident_tag = DEFAULT_INCIDENT
+    eventtype_tag = DEFAULT_EVENTTYPE
+    # Non-interactive defaults will be used if provided; interactive will ask
+    if args.non_interactive:
+        # collect tags from flags plus defaults
+        if args.tags:
+            auto_tags = args.tags.copy()
+        # ensure playbook baseline present
+        auto_tags.extend([tlp_tag, incident_tag, eventtype_tag])
+        # add ATT&CK default
+        auto_tags.extend(DEFAULT_ATTACK_TAGS)
+        # add sector default unless user gave tags including a sector
+        if not any(t.startswith("sector:") for t in auto_tags):
+            auto_tags.append(DEFAULT_SECTOR)
+        # admiralty event-level
+        adm_src = args.admiralty_src
+        adm_info = args.admiralty_info
+        auto_tags.append(f"admiralty-scale:source-reliability={adm_src}")
+        auto_tags.append(f"admiralty-scale:information-credibility={adm_info}")
+    else:
+        # interactive: prompt
+        tlp_tag = prompt("TLP tag", default=DEFAULT_TLP)
+        sector = prompt("Sector tag (blank to skip)", default=DEFAULT_SECTOR)
+        use_attack = bool_prompt("Apply default ATT&CK DoS tags?", default=True)
+        adm_src = prompt("Admiralty source reliability (A-E)", default=DEFAULT_ADMIRALTY_SRC).upper()
+        adm_info = prompt("Admiralty information credibility (1-6)", default=DEFAULT_ADMIRALTY_INFO)
+        auto_tags = [tlp_tag, incident_tag, eventtype_tag]
+        if use_attack:
+            auto_tags.extend(DEFAULT_ATTACK_TAGS)
+        if sector:
+            auto_tags.append(sector)
+        auto_tags.append(f"admiralty-scale:source-reliability={adm_src}")
+        auto_tags.append(f"admiralty-scale:information-credibility={adm_info}")
+        if args.tags:
+            auto_tags.extend(args.tags)
+
+    # Apply event-level tags
+    apply_event_tags(misp, event_uuid, list(dict.fromkeys(auto_tags)))  # dedupe preserving order
+
+    # CSV import
+    if args.csv:
+        mapping = load_mapping(args.mapping)
+        rows = read_csv_rows(args.csv)
+        if not rows:
+            print("CSV contained no rows, exiting.")
+            sys.exit(0)
+        print(f"Importing {len(rows)} rows into object template '{args.object}'")
+        # object-level tags to apply
+        obj_tags = args.tags[:] if args.tags else []
+        # add attribute-level admiralty tags if requested
+        if args.attr_admiralty:
+            obj_tags.append(f"admiralty-scale:source-reliability={args.attr_admiralty_src}")
+            obj_tags.append(f"admiralty-scale:information-credibility={args.attr_admiralty_info}")
+
+        added = 0
+        skipped = 0
+        for row in rows:
+            # If mapping contains 'ip' and we want to dedupe per-event, do a check
+            ip_col = None
+            for col, attr in mapping.items():
+                if attr == "ip":
+                    ip_col = col
+                    break
+            if ip_col:
+                val = row.get(ip_col) or row.get(ip_col.lower()) or row.get(ip_col.upper())
+                if val:
+                    # check duplicates for ip-dst and ip-src both if exists
+                    if attribute_exists_in_event(misp, event_id, val, "ip-dst") or attribute_exists_in_event(misp, event_id, val, "ip-src"):
+                        print(f"Skipping duplicate IP in event: {val}")
+                        skipped += 1
+                        continue
+            obj = add_object_from_row(misp, event_uuid, args.object, mapping, row)
+            if obj:
+                added += 1
+                # tag object
+                if obj_tags:
+                    apply_tags_to_object(misp, obj, obj_tags)
+                print(f"Added object uuid {obj['Object']['uuid']}")
+            else:
+                print("Failed to add object for row:", row)
+        print(f"CSV import complete. Added {added}, skipped {skipped}.")
+
+    # Publish if requested
+    if args.publish:
+        try:
+            misp.publish(event_id)
+            print(f"Event published: {misp_url}/events/view/{event_id}")
+        except Exception as e:
+            print("Publish failed:", e)
+    else:
+        print(f"Saved event (not published): {misp_url}/events/view/{event_id}")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nAborted by user.")
+        sys.exit(1)
