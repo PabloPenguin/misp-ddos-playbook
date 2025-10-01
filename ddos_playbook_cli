@@ -1,338 +1,586 @@
 #!/usr/bin/env python3
-# ddos_playbook_cli.py
-# DDoS Playbook CLI for MISP - interactive + non-interactive
-# Requirements: pip install pymisp python-dotenv requests
+"""
+ddos_playbook_cli.py — Fixed DDoS playbook CLI for MISP with robust client construction and diagnostics.
+
+This is the simplified DDoS-focused script:
+- Attributes-only ingestion (no MISP object creation).
+- Enforces playbook tags.
+- Handles ATT&CK T1498 and optional sub-techniques (attach or fallback to tag).
+- Supports --replace-existing, --dry-run, --non-interactive.
+- Robust make_client() that coerces verify values, tries multiple ExpandedPyMISP signatures,
+  and prints diagnostics about the constructed client and reachability (safe, non-destructive).
+"""
+
+from __future__ import annotations
 
 import os
 import sys
 import csv
-import json
 import argparse
 from datetime import datetime
-from getpass import getpass
-from typing import Dict, List, Optional
+from typing import Optional, List
 
-from pymisp import ExpandedPyMISP, MISPEvent, MISPObject
+# PyMISP imports
+try:
+    from pymisp import ExpandedPyMISP, MISPAttribute
+    from pymisp.exceptions import PyMISPError
+except Exception:
+    raise RuntimeError("Missing dependency: pymisp. Install with `pip install pymisp`")
 
-# ------------- Defaults - adjust as needed -------------
-DEFAULT_ATTACK_TAGS = ["mitre-attack-pattern:T1498", "mitre-attack-pattern:T1498.001"]
-DEFAULT_TLP = "tlp:green"
-DEFAULT_INCIDENT = 'information-security-indicators:incident-type="ddos"'
-DEFAULT_EVENTTYPE = "misp-event-type:incident"
-DEFAULT_SECTOR = "sector:finance"
-DEFAULT_ADMIRALTY_SRC = "B"
-DEFAULT_ADMIRALTY_INFO = "2"
-DEFAULT_ATTR_ADMIRALTY_SRC = "C"
-DEFAULT_ATTR_ADMIRALTY_INFO = "4"
-DEFAULT_OBJECT_TEMPLATE = "ip-port"
-DEFAULT_MAPPING = {"ip": "ip", "port": "port", "asn": "asn", "comment": "comment"}
-# -------------------------------------------------------
+# Playbook defaults
+DEFAULT_PLAYBOOK_TAGS = [
+    "tlp:green",
+    'information-security-indicators:incident-type="ddos"',
+    "misp-event-type:incident",
+    "workflow:state=local",
+]
+DEFAULT_ATTACK_TAG = "mitre-attack-pattern:T1498"
+DEFAULT_ATTACK_SUBS = [
+    "mitre-attack-pattern:T1498.001",
+    "mitre-attack-pattern:T1498.002",
+]
 
-def init_misp(url: str, key: str, verify: bool) -> ExpandedPyMISP:
-    return ExpandedPyMISP(url, key, ssl=verify)
 
-def prompt(msg: str, default: Optional[str] = None, required: bool = False) -> str:
-    while True:
-        p = input(f"{msg}{(' ['+default+']' if default else '')}: ").strip()
-        if not p and default is not None:
-            p = default
-        if required and not p:
-            print("  -> required")
-            continue
-        return p
+def _maybe_show_defaults_and_exit():
+    if "--show-default-tags" in sys.argv:
+        print("Defaults applied to every event:")
+        for t in DEFAULT_PLAYBOOK_TAGS:
+            print("  -", t)
+        print("Always add (tag/galaxy):", DEFAULT_ATTACK_TAG)
+        print("Optional sub-techniques:", ", ".join(DEFAULT_ATTACK_SUBS))
+        sys.exit(0)
 
-def bool_prompt(msg: str, default: bool = True) -> bool:
-    d = "Y/n" if default else "y/N"
-    r = input(f"{msg} [{d}]: ").strip().lower()
-    if r == "":
-        return default
-    return r in ("y", "yes", "y", "1", "true")
 
-def load_mapping(mapping_file: Optional[str]) -> Dict[str,str]:
-    if mapping_file:
-        if not os.path.exists(mapping_file):
-            raise FileNotFoundError(f"Mapping file not found: {mapping_file}")
-        with open(mapping_file) as fh:
-            return json.load(fh)
-    return DEFAULT_MAPPING.copy()
+_maybe_show_defaults_and_exit()
 
-def create_event_interactive(misp: ExpandedPyMISP) -> dict:
-    print("Creating new event (interactive)...")
-    info = prompt("Event title/info", default="DDoS campaign")
-    date = prompt("Event date (YYYY-MM-DD)", default=datetime.utcnow().strftime("%Y-%m-%d"))
-    thr = int(prompt("Threat level id (1=High,2=Medium,3=Low,4=Undefined)", default="1"))
-    analysis = int(prompt("Analysis (0=Initial,1=Ongoing,2=Completed)", default="0"))
-    distribution = int(prompt("Distribution (0=Your org,1=this community,2=connected,3=all)", default="1"))
-    ev = misp.add_event({
-        "info": info,
-        "date": date,
-        "threat_level_id": thr,
-        "analysis": analysis,
-        "distribution": distribution,
-        "published": False
-    })
-    if not ev or "Event" not in ev:
-        raise RuntimeError("Failed to create event")
-    print(f"Created event id {ev['Event']['id']}")
-    return ev["Event"]
 
-def create_event_noninteractive(misp: ExpandedPyMISP, info: str, date: str, threat_level: int, analysis: int, distribution: int) -> dict:
-    ev = misp.add_event({
-        "info": info,
-        "date": date,
-        "threat_level_id": threat_level,
-        "analysis": analysis,
-        "distribution": distribution,
-        "published": False
-    })
-    if not ev or "Event" not in ev:
-        raise RuntimeError("Failed to create event")
-    return ev["Event"]
-
-def get_existing_event(misp: ExpandedPyMISP, event_id_or_uuid: str) -> dict:
-    # Accept numeric id or uuid
+def load_env():
     try:
-        if event_id_or_uuid.isdigit():
-            ev = misp.get(int(event_id_or_uuid))
-            return ev.get("Event")
+        from dotenv import load_dotenv
+
+        load_dotenv(override=False)
     except Exception:
         pass
-    # fallback uuid
-    ev = misp.get(event_id_or_uuid)
-    if ev and "Event" in ev:
-        return ev["Event"]
-    raise RuntimeError("Event not found")
 
-def apply_event_tags(misp: ExpandedPyMISP, event_uuid: str, tags: List[str]):
-    for t in tags:
+
+# Robust client constructor with diagnostics
+def make_client(url: str, key: str, verify_input) -> ExpandedPyMISP:
+    """
+    Construct an ExpandedPyMISP client in a defensive way:
+     - Coerce verify_input (accepts bool, "false"/"true", "0"/"1", or a CA bundle path).
+     - Try several constructor signatures.
+     - Print diagnostics about resulting client and attempt a lightweight version check.
+    """
+    if not url:
+        raise ValueError("MISP URL must be provided")
+    if not key:
+        raise ValueError("MISP API key must be provided")
+
+    # Ensure URL has scheme
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ValueError(f"MISP URL must include http:// or https://: got '{url}'")
+
+    # Normalize verify_input
+    verify = verify_input
+    if isinstance(verify_input, str):
+        vl = verify_input.strip().lower()
+        if vl in ("0", "false", "no", ""):
+            verify = False
+        elif vl in ("1", "true", "yes"):
+            verify = True
+        else:
+            # treat as path to CA bundle (string left as-is)
+            verify = verify_input
+    else:
+        # non-string -> coerce to bool
+        verify = bool(verify_input)
+
+    last_exc = None
+
+    def _print_client_diag(client, requested_verify):
         try:
-            misp.tag(event_uuid, t)
-        except Exception as e:
-            print(f"Warning applying tag {t}: {e}")
+            info = {}
+            info["root_url"] = getattr(client, "root_url", None) or getattr(client, "url", None) or "<unknown>"
+            info["client_attrs"] = {
+                "ssl": getattr(client, "ssl", None),
+                "verify": getattr(client, "verify", None),
+                "cert": getattr(client, "cert", None),
+                "session": getattr(client, "session", None),
+            }
+            info["requested_verify"] = requested_verify
+            print("MISP client diagnostic:", info, file=sys.stderr)
+            # Try a non-destructive version check if available
+            try:
+                ver = None
+                if hasattr(client, "get_version"):
+                    ver = client.get_version()
+                else:
+                    # try servers/getVersion endpoint
+                    try:
+                        ver = client.get("servers/getVersion")
+                    except Exception:
+                        ver = None
+                print("MISP version check result:", repr(ver), file=sys.stderr)
+            except Exception as e:
+                print("MISP version check failed:", repr(e), file=sys.stderr)
+        except Exception:
+            pass
 
-def read_csv_rows(csv_path: str) -> List[Dict[str,str]]:
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(csv_path)
-    with open(csv_path, newline='') as fh:
-        reader = csv.DictReader(fh)
-        return [row for row in reader]
-
-def add_object_from_row(misp: ExpandedPyMISP, event_uuid: str, template: str, mapping: Dict[str,str], row: Dict[str,str]) -> Optional[dict]:
-    obj = MISPObject(template)
-    for col, attr in mapping.items():
-        val = row.get(col) or row.get(col.lower()) or row.get(col.upper())
-        if val:
-            obj.add_attribute(attr, val)
-    comment = None
-    # set comment if mapped
-    comment_field = None
-    for k,v in mapping.items():
-        if v == "comment":
-            comment_field = k
-            break
-    if comment_field:
-        comment = row.get(comment_field)
-        if comment:
-            obj.comment = comment
+    # Try keyword-style constructor first (newer PyMISP)
     try:
-        added = misp.add_object(event_uuid, obj)
-        return added
+        client = ExpandedPyMISP(url=url, key=key, ssl=verify, tool="ddos-playbook-cli")
+        _print_client_diag(client, verify)
+        return client
+    except TypeError as e:
+        last_exc = e
     except Exception as e:
-        print(f"Failed to add object for row {row}: {e}")
+        last_exc = e
+
+    # Try positional (url, key, ssl)
+    try:
+        client = ExpandedPyMISP(url, key, verify)
+        _print_client_diag(client, verify)
+        return client
+    except Exception as e:
+        last_exc = e
+
+    # Try minimal (url, key)
+    try:
+        client = ExpandedPyMISP(url, key)
+        _print_client_diag(client, verify)
+        return client
+    except Exception as e:
+        last_exc = e
+
+    raise RuntimeError(f"Unable to construct ExpandedPyMISP client (tried multiple signatures): {last_exc}")
+
+
+# --- Attribute helpers (attributes-only approach) ---
+def add_attribute(misp: ExpandedPyMISP, event, attr_type: str, value: Optional[str], category: str = "Network activity",
+                  to_ids: bool = True, comment: Optional[str] = None, dry_run: bool = False):
+    if not value or not str(value).strip():
+        return None
+    v = str(value).strip()
+    if dry_run:
+        print(f"[dry-run] add_attribute: {attr_type} = {v} (comment={comment})")
+        return {"type": attr_type, "value": v}
+    a = MISPAttribute()
+    a.type = attr_type
+    a.value = v
+    a.category = category
+    a.to_ids = bool(to_ids)
+    if comment:
+        a.comment = comment
+    try:
+        return misp.add_attribute(event, a, pythonify=True)
+    except Exception as e:
+        print(f"Error adding attribute {attr_type}:{v}: {e}", file=sys.stderr)
         return None
 
-def attribute_exists_in_event(misp: ExpandedPyMISP, event_id: int, value: str, attr_type: str="ip-dst") -> bool:
-    # search attributes by value and eventid
+
+def add_annotation_comment(misp: ExpandedPyMISP, ev, text: Optional[str], dry_run: bool = False) -> bool:
+    if not text or not str(text).strip():
+        return False
+    if dry_run:
+        print(f"[dry-run] add annotation/comment to {get_event_identifier(ev)}: {text[:80]}")
+        return True
+    a = MISPAttribute()
+    a.type = "comment"
+    a.value = str(text).strip()
+    a.category = "External analysis"
     try:
-        res = misp.search(controller='attributes', eventid=event_id, value=value, type_attribute=attr_type, limit=1)
-        return bool(res)
-    except Exception:
+        misp.add_attribute(ev, a, pythonify=True)
+        return True
+    except Exception as e:
+        print(f"Warning: failed to add comment attribute: {e}", file=sys.stderr)
         return False
 
-def apply_tags_to_object(misp: ExpandedPyMISP, obj_dict: dict, tags: List[str]):
-    # obj_dict has 'Object' with 'uuid'
-    if not obj_dict or "Object" not in obj_dict:
-        return
-    uuid = obj_dict["Object"]["uuid"]
-    for t in tags:
+
+# --- Event helpers ---
+def get_event_identifier(event) -> str:
+    try:
+        if isinstance(event, dict):
+            ev = event.get("Event", {}) or event
+            return str(ev.get("id") or ev.get("uuid") or "unknown")
+        return str(getattr(event, "id", None) or getattr(event, "uuid", "unknown"))
+    except Exception:
+        return "unknown"
+
+
+def safe_get_event(misp: ExpandedPyMISP, event_id_or_uuid: str):
+    if not event_id_or_uuid:
+        return None
+    try:
+        ev = misp.get_event(event_id_or_uuid, pythonify=True)
+        if ev:
+            return ev
+    except Exception:
+        pass
+    try:
+        res = misp.search("events", id=event_id_or_uuid)
+        if res:
+            first = res[0]
+            eid = None
+            if isinstance(first, dict):
+                eid = first.get("Event", {}).get("id") or first.get("id")
+            if eid:
+                return misp.get_event(eid, pythonify=True)
+    except Exception:
+        pass
+    return None
+
+
+def clear_event_attributes(misp: ExpandedPyMISP, event, dry_run: bool = False) -> dict:
+    summary = {"deleted": 0, "errors": 0}
+    ev_id = None
+    try:
+        if isinstance(event, dict):
+            ev_id = (event.get("Event", {}) or event).get("id")
+        else:
+            ev_id = getattr(event, "id", None)
+    except Exception:
+        ev_id = None
+    if not ev_id:
+        print("Warning: couldn't determine event id for clearing attributes.", file=sys.stderr)
+        return summary
+    try:
+        raw = misp.get_event(ev_id, pythonify=False)
+        attributes = raw.get("Event", {}).get("Attribute", []) if isinstance(raw, dict) else []
+    except Exception as e:
+        print(f"Warning: failed to fetch raw event to clear attributes: {e}", file=sys.stderr)
+        return summary
+    for a in attributes:
         try:
-            misp.tag(uuid, t)
+            attr_id = a.get("id") or (a.get("Attribute", {}) and a.get("Attribute", {}).get("id"))
+            if not attr_id:
+                continue
+            if dry_run:
+                print(f"[dry-run] would delete attribute id={attr_id}")
+                summary["deleted"] += 1
+                continue
+            try:
+                misp.delete_attribute(attr_id)
+                summary["deleted"] += 1
+            except Exception:
+                try:
+                    misp.delete_attribute(int(attr_id))
+                    summary["deleted"] += 1
+                except Exception as e2:
+                    print(f"Warning: failed to delete attribute {attr_id}: {e2}", file=sys.stderr)
+                    summary["errors"] += 1
         except Exception as e:
-            print(f"Warning tagging object {uuid} with {t}: {e}")
+            print(f"Warning iterating attribute record: {e}", file=sys.stderr)
+            summary["errors"] += 1
+    return summary
+
+
+# --- Tagging and galaxy attach (T1498-focused) ---
+def apply_event_tags(misp: ExpandedPyMISP, event, tags: Optional[List[str]], dry_run: bool = False):
+    if not tags:
+        return
+    for t in tags:
+        if not t:
+            continue
+        if dry_run:
+            print(f"[dry-run] would tag event {get_event_identifier(event)} with: {t}")
+            continue
+        try:
+            misp.tag(event, t)
+        except Exception as e:
+            print(f"Warning applying tag {t}: {e}", file=sys.stderr)
+
+
+def attach_attack_cluster(misp: ExpandedPyMISP, event, cluster_id: str, dry_run: bool = False) -> bool:
+    """
+    Attempt to attach a galaxy cluster for ATT&CK. If cluster attach fails, fallback to tagging.
+    This function is defensive and reports the result.
+    """
+    if dry_run:
+        print(f"[dry-run] would attach cluster '{cluster_id}' to event {get_event_identifier(event)}")
+        return True
+    # Try the most common attach method(s)
+    try:
+        # Some PyMISP versions accept a dict/cluster structure
+        try:
+            misp.add_event_galaxy_cluster(event, {"value": cluster_id})
+            print(f"✔ Attached galaxy cluster: {cluster_id}")
+            return True
+        except Exception:
+            pass
+        try:
+            misp.add_event_galaxy(event, {"value": cluster_id})
+            print(f"✔ Attached galaxy cluster (add_event_galaxy): {cluster_id}")
+            return True
+        except Exception:
+            pass
+        # Some older versions required an id or different form; instead of guessing further, fallback to tagging
+    except Exception:
+        pass
+
+    # Fallback: tag the event with the cluster_id so the info is present
+    try:
+        misp.tag(event, cluster_id)
+        print(f"⚠ Galaxy attach failed; fallback tag applied: {cluster_id}")
+        return True
+    except Exception as e:
+        print(f"❌ Could not attach or tag cluster {cluster_id}: {e}", file=sys.stderr)
+        return False
+
+
+# --- Event/creation/import flows ---
+def create_event(misp: ExpandedPyMISP, info: str, date: Optional[str] = None, dry_run: bool = False):
+    if not info or not str(info).strip():
+        raise ValueError("Event info/title must be non-empty")
+    payload = {
+        "info": str(info).strip(),
+        "date": date or datetime.utcnow().strftime("%Y-%m-%d"),
+        "analysis": 0,
+        "distribution": 0,
+        "published": False,
+    }
+    if dry_run:
+        print(f"[dry-run] would create event with info: {payload['info']}")
+        return {"Event": {"id": "dry-run", "info": payload["info"]}}
+    ev = misp.add_event(payload, pythonify=True)
+    try:
+        ev.distribution = 0
+    except Exception:
+        pass
+
+    # Apply enforced tags and ATT&CK tag (as a tag fallback)
+    apply_event_tags(misp, ev, DEFAULT_PLAYBOOK_TAGS, dry_run=dry_run)
+    apply_event_tags(misp, ev, [DEFAULT_ATTACK_TAG], dry_run=dry_run)
+
+    # Attempt to attach the T1498 cluster (if API supports it)
+    try:
+        attached = attach_attack_cluster(misp, ev, DEFAULT_ATTACK_TAG, dry_run=dry_run)
+        if not attached:
+            print("Note: ATT&CK T1498 not attached as galaxy; event still tagged.", file=sys.stderr)
+    except Exception:
+        pass
+
+    # Save the title/info as an annotation comment for traceability
+    add_annotation_comment(misp, ev, payload["info"], dry_run=dry_run)
+    return ev
+
+
+def import_rows_to_event(misp: ExpandedPyMISP, event, rows: List[dict], dry_run: bool = False):
+    summary = {"processed": 0, "skipped": 0, "created_attributes": 0}
+    for row in rows:
+        summary["processed"] += 1
+        comment = None
+        # simple column conventions supported (ip, victim_ip, amplification, port, asn, comment)
+        if row.get("comment"):
+            comment = row.get("comment")
+        attacker_ip = row.get("ip") or row.get("attacker_ip") or row.get("source_ip")
+        victim_ip = row.get("victim_ip") or row.get("target") or row.get("ip_dst")
+        amplifier = row.get("amplification") or row.get("amplifier")
+        port = row.get("port")
+        asn = row.get("asn")
+        created_any = False
+        if attacker_ip and str(attacker_ip).strip():
+            if add_attribute(misp, event, "ip-src", attacker_ip, comment=comment, dry_run=dry_run):
+                summary["created_attributes"] += 1
+                created_any = True
+        if victim_ip and str(victim_ip).strip():
+            if add_attribute(misp, event, "ip-dst", victim_ip, comment=comment, dry_run=dry_run):
+                summary["created_attributes"] += 1
+                created_any = True
+        if amplifier and str(amplifier).strip():
+            if add_attribute(misp, event, "ip-dst", amplifier, comment=comment, dry_run=dry_run):
+                summary["created_attributes"] += 1
+                created_any = True
+        if port and str(port).strip() not in ("0", "none", ""):
+            if add_attribute(misp, event, "port", str(port), category="Network activity", to_ids=False, comment=comment, dry_run=dry_run):
+                summary["created_attributes"] += 1
+                created_any = True
+        if asn and str(asn).strip():
+            if add_attribute(misp, event, "asn", str(asn), category="Internal reference", to_ids=False, comment=comment, dry_run=dry_run):
+                summary["created_attributes"] += 1
+                created_any = True
+        if comment:
+            add_annotation_comment(misp, event, comment, dry_run=dry_run)
+        if not created_any:
+            summary["skipped"] += 1
+    return summary
+
+
+# --- CLI flows ---
+def run_interactive(misp: ExpandedPyMISP, args):
+    while True:
+        choice = input("Create new event or update existing? (new/existing) [new]: ").strip() or "new"
+        if choice.lower().startswith("e"):
+            eid = input("Enter existing Event ID or UUID: ").strip()
+            ev = safe_get_event(misp, eid)
+            if not ev:
+                print(f"Event not found: {eid}", file=sys.stderr)
+                continue
+            replace = input("Replace existing attributes in this event? (y/N): ").strip().lower() in ("y", "yes")
+            if replace:
+                summary = clear_event_attributes(misp, ev, dry_run=args.dry_run)
+                print(f"Cleared attributes: {summary}")
+            break
+        else:
+            info = input("Event info/title (required): ").strip()
+            if not info:
+                print("Event info is required. Please enter a non-empty event title.", file=sys.stderr)
+                continue
+            ev = create_event(misp, info, dry_run=args.dry_run)
+            break
+
+    print(f"Working on event: {get_event_identifier(ev)}")
+
+    # Ask about T1498 and sub-techniques
+    if input("Attach ATT&CK T1498 (Network DoS)? (Y/n): ").strip().lower() in ("", "y", "yes"):
+        attach_attack_cluster(misp, ev, DEFAULT_ATTACK_TAG, dry_run=args.dry_run)
+
+    if input("Attach T1498.001 (Direct Network Flood)? (y/N): ").strip().lower() in ("y", "yes"):
+        attach_attack_cluster(misp, ev, DEFAULT_ATTACK_SUBS[0], dry_run=args.dry_run)
+
+    if input("Attach T1498.002 (Amplification)? (y/N): ").strip().lower() in ("y", "yes"):
+        attach_attack_cluster(misp, ev, DEFAULT_ATTACK_SUBS[1], dry_run=args.dry_run)
+
+    # Optionally tag actor/malware/tool (tags only)
+    actor = input("Threat Actor tag (blank to skip): ").strip() or None
+    malware = input("Malware tag (blank to skip): ").strip() or None
+    tool = input("Tool tag (blank to skip): ").strip() or None
+    apply_event_tags(misp, ev, [f"threat-actor:{actor}"] if actor else None, dry_run=args.dry_run)
+    apply_event_tags(misp, ev, [f"malware:{malware}"] if malware else None, dry_run=args.dry_run)
+    apply_event_tags(misp, ev, [f"tool:{tool}"] if tool else None, dry_run=args.dry_run)
+
+    csv_path = input("CSV path to import rows (blank to skip): ").strip()
+    if csv_path:
+        try:
+            rows = read_csv_rows(csv_path)
+        except Exception as e:
+            print(f"Failed to read CSV: {e}", file=sys.stderr)
+            rows = []
+        if not rows:
+            print("CSV provided but no rows found.", file=sys.stderr)
+        else:
+            summary = import_rows_to_event(misp, ev, rows, dry_run=args.dry_run)
+            print("Import summary:", summary)
+
+    # final annotation using event.info if present
+    try:
+        ev_info = getattr(ev, "info", None) or (ev.get("Event", {}).get("info") if isinstance(ev, dict) else None)
+        add_annotation_comment(misp, ev, ev_info, dry_run=args.dry_run)
+    except Exception:
+        pass
+
+    print("Done (interactive).")
+
+
+def run_noninteractive(misp: ExpandedPyMISP, args):
+    if args.event:
+        ev = safe_get_event(misp, args.event)
+        if not ev:
+            print(f"Event {args.event} not found", file=sys.stderr)
+            return
+        if args.replace_existing:
+            summary = clear_event_attributes(misp, ev, dry_run=args.dry_run)
+            print(f"Cleared attributes: {summary}")
+    else:
+        if not args.info or not str(args.info).strip():
+            print("Non-interactive creation requires a non-empty --info", file=sys.stderr)
+            return
+        ev = create_event(misp, args.info.strip(), date=args.date, dry_run=args.dry_run)
+
+    # T1498 attachments via flags
+    if args.attach_t1498:
+        attach_attack_cluster(misp, ev, DEFAULT_ATTACK_TAG, dry_run=args.dry_run)
+    if args.attach_t1498_001:
+        attach_attack_cluster(misp, ev, DEFAULT_ATTACK_SUBS[0], dry_run=args.dry_run)
+    if args.attach_t1498_002:
+        attach_attack_cluster(misp, ev, DEFAULT_ATTACK_SUBS[1], dry_run=args.dry_run)
+
+    # Tags for actor/malware/tool
+    apply_event_tags(misp, ev, [f"threat-actor:{args.actor}"] if args.actor else None, dry_run=args.dry_run)
+    apply_event_tags(misp, ev, [f"malware:{args.malware}"] if args.malware else None, dry_run=args.dry_run)
+    apply_event_tags(misp, ev, [f"tool:{args.tool}"] if args.tool else None, dry_run=args.dry_run)
+
+    if args.csv:
+        try:
+            rows = read_csv_rows(args.csv)
+        except Exception as e:
+            print(f"Failed to read CSV: {e}", file=sys.stderr)
+            return
+        if not rows:
+            print("CSV provided but no rows found.", file=sys.stderr)
+            return
+        summary = import_rows_to_event(misp, ev, rows, dry_run=args.dry_run)
+        print("Import summary:", summary)
+
+    if args.narrative:
+        add_annotation_comment(misp, ev, args.narrative, dry_run=args.dry_run)
+
+    print("Non-interactive run completed.")
+
+
+# CLI helpers
+def read_csv_rows(path: str) -> List[dict]:
+    rows = []
+    with open(path, newline="", encoding="utf-8") as f:
+        rdr = csv.DictReader(f)
+        for r in rdr:
+            rows.append({k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in r.items()})
+    return rows
+
+
+def build_argparser():
+    p = argparse.ArgumentParser(description="DDoS Playbook CLI for MISP (T1498-focused)")
+    p.add_argument("--url", help="MISP URL (env MISP_URL fallback)")
+    p.add_argument("--key", help="MISP API key (env MISP_KEY fallback)")
+    p.add_argument("--verify", help="Verify SSL for MISP (true/false or path to CA bundle). Defaults to env MISP_VERIFY_SSL or true.", default=None)
+    p.add_argument("--show-default-tags", action="store_true", help="Show enforced defaults and exit")
+    p.add_argument("--non-interactive", action="store_true", help="Run non-interactive")
+    p.add_argument("--replace-existing", action="store_true", help="When updating an existing event, delete existing attributes before importing new ones")
+    p.add_argument("--info", help="Event info/title for non-interactive create")
+    p.add_argument("--date", help="Event date YYYY-MM-DD for non-interactive create")
+    p.add_argument("--event", help="Existing event ID or UUID to update instead of creating new")
+    p.add_argument("--attach-t1498", action="store_true", help="Attach ATT&CK T1498 (non-interactive)")
+    p.add_argument("--attach-t1498-001", action="store_true", help="Attach ATT&CK T1498.001 (non-interactive)")
+    p.add_argument("--attach-t1498-002", action="store_true", help="Attach ATT&CK T1498.002 (non-interactive)")
+    p.add_argument("--actor", help="Threat actor tag (non-interactive)")
+    p.add_argument("--malware", help="Malware tag (non-interactive)")
+    p.add_argument("--tool", help="Tool tag (non-interactive)")
+    p.add_argument("--csv", help="Path to CSV file to import")
+    p.add_argument("--narrative", help="Narrative string to add as annotation (saved as comment)")
+    p.add_argument("--dry-run", action="store_true", help="Validate and print actions without making API changes")
+    return p
+
 
 def main():
-    # CLI args
-    ap = argparse.ArgumentParser(description="DDoS Playbook CLI for MISP (interactive + non-interactive)")
-    # connection
-    ap.add_argument("--url", help="MISP URL (or set MISP_URL env/.env)")
-    ap.add_argument("--key", help="MISP API key (or set MISP_KEY env/.env)")
-    ap.add_argument("--verify", action="store_true", help="Verify SSL certs (default false)")
-    # event control
-    group = ap.add_mutually_exclusive_group()
-    group.add_argument("--new-event", action="store_true", help="Create new event (interactive unless flags provided)")
-    group.add_argument("--event-id", help="Use existing event ID or UUID")
-    # non-interactive event params
-    ap.add_argument("--info", help="Event info/title (non-interactive)")
-    ap.add_argument("--date", help="Event date YYYY-MM-DD (non-interactive)")
-    ap.add_argument("--threat-level", type=int, default=2, help="Threat level id (non-interactive)")
-    ap.add_argument("--analysis", type=int, default=0, help="Analysis level (non-interactive)")
-    ap.add_argument("--distribution", type=int, default=1, help="Distribution (non-interactive)")
-    # csv/object import & mapping
-    ap.add_argument("--csv", help="Path to CSV file to import (rows -> objects)")
-    ap.add_argument("--object", default=DEFAULT_OBJECT_TEMPLATE, help="MISP object template name (default ip-port)")
-    ap.add_argument("--mapping", help="JSON mapping file (column->object-attribute). Default maps ip->ip,port->port,asn->asn,comment->comment")
-    # tagging / admiralty
-    ap.add_argument("--tags", nargs="+", help="Additional tags to apply to each object (e.g. tlp:amber admiralty-scale:source-reliability=B)")
-    ap.add_argument("--admiralty-src", help="Event-level admiralty source reliability (A-E)", default=DEFAULT_ADMIRALTY_SRC)
-    ap.add_argument("--admiralty-info", help="Event-level admiralty information credibility (1-6)", default=DEFAULT_ADMIRALTY_INFO)
-    ap.add_argument("--attr-admiralty", action="store_true", help="Apply attribute/object-level admiralty defaults to imported objects")
-    ap.add_argument("--attr-admiralty-src", help="Attribute-level admiralty source reliability default", default=DEFAULT_ATTR_ADMIRALTY_SRC)
-    ap.add_argument("--attr-admiralty-info", help="Attribute-level admiralty information credibility default", default=DEFAULT_ATTR_ADMIRALTY_INFO)
-    # publishing & non-interactive mode
-    ap.add_argument("--publish", action="store_true", help="Publish the event after import")
-    ap.add_argument("--non-interactive", action="store_true", help="Run fully non-interactive (requires flags for creation and csv)")
-    args = ap.parse_args()
+    load_env()
+    parser = build_argparser()
+    args = parser.parse_args()
 
-    # load env fallback
-    from dotenv import load_dotenv
-    load_dotenv()
+    if args.show_default_tags:
+        print("Enforced DEFAULT_PLAYBOOK_TAGS:")
+        for t in DEFAULT_PLAYBOOK_TAGS:
+            print(" - " + t)
+        print("\nDEFAULT_ATTACK_TAG:", DEFAULT_ATTACK_TAG)
+        return
+
     misp_url = args.url or os.getenv("MISP_URL")
     misp_key = args.key or os.getenv("MISP_KEY")
-    if not misp_url:
-        misp_url = prompt("MISP URL (e.g. https://misp.example)", required=True)
-    if not misp_key:
-        misp_key = getpass("MISP API key: ")
+    verify_input = args.verify if args.verify is not None else os.getenv("MISP_VERIFY_SSL", "true")
 
-    misp = init_misp(misp_url, misp_key, verify=args.verify)
+    if not misp_url or not misp_key:
+        print("MISP URL and API key must be provided via flags or environment (MISP_URL, MISP_KEY)", file=sys.stderr)
+        sys.exit(2)
 
-    # Determine event
-    event_obj = None
-    if args.event_id:
-        event_obj = get_existing_event(misp, args.event_id)
-    elif args.new_event:
-        # If non-interactive, require info/date etc
-        if args.non_interactive:
-            if not args.info or not args.date:
-                print("In non-interactive mode --new-event requires --info and --date")
-                sys.exit(2)
-            event_obj = create_event_noninteractive(misp, args.info, args.date, args.threat_level, args.analysis, args.distribution)
-        else:
-            # interactive creation
-            event_obj = create_event_interactive(misp)
-    else:
-        # If not specified, interactive prompt to choose create or use existing
-        if args.non_interactive:
-            print("In non-interactive mode you must specify --new-event or --event-id")
-            sys.exit(2)
-        choice = prompt("Create new event or update existing? (new/existing)", default="new")
-        if choice == "existing":
-            eid = prompt("Enter existing Event ID or UUID", required=True)
-            event_obj = get_existing_event(misp, eid)
-        else:
-            event_obj = create_event_interactive(misp)
+    try:
+        misp = make_client(misp_url, misp_key, verify_input)
+    except Exception as e:
+        print(f"Failed to create MISP client: {e}", file=sys.stderr)
+        sys.exit(2)
 
-    event_id = int(event_obj["id"])
-    event_uuid = event_obj["uuid"]
-    print(f"Operating on event {event_id} ({event_uuid})")
-
-    # Build event-level tags (playbook)
-    auto_tags = []
-    tlp_tag = DEFAULT_TLP
-    incident_tag = DEFAULT_INCIDENT
-    eventtype_tag = DEFAULT_EVENTTYPE
-    # Non-interactive defaults will be used if provided; interactive will ask
     if args.non_interactive:
-        # collect tags from flags plus defaults
-        if args.tags:
-            auto_tags = args.tags.copy()
-        # ensure playbook baseline present
-        auto_tags.extend([tlp_tag, incident_tag, eventtype_tag])
-        # add ATT&CK default
-        auto_tags.extend(DEFAULT_ATTACK_TAGS)
-        # add sector default unless user gave tags including a sector
-        if not any(t.startswith("sector:") for t in auto_tags):
-            auto_tags.append(DEFAULT_SECTOR)
-        # admiralty event-level
-        adm_src = args.admiralty_src
-        adm_info = args.admiralty_info
-        auto_tags.append(f"admiralty-scale:source-reliability={adm_src}")
-        auto_tags.append(f"admiralty-scale:information-credibility={adm_info}")
+        run_noninteractive(misp, args)
     else:
-        # interactive: prompt
-        tlp_tag = prompt("TLP tag", default=DEFAULT_TLP)
-        sector = prompt("Sector tag (blank to skip)", default=DEFAULT_SECTOR)
-        use_attack = bool_prompt("Apply default ATT&CK DoS tags?", default=True)
-        adm_src = prompt("Admiralty source reliability (A-E)", default=DEFAULT_ADMIRALTY_SRC).upper()
-        adm_info = prompt("Admiralty information credibility (1-6)", default=DEFAULT_ADMIRALTY_INFO)
-        auto_tags = [tlp_tag, incident_tag, eventtype_tag]
-        if use_attack:
-            auto_tags.extend(DEFAULT_ATTACK_TAGS)
-        if sector:
-            auto_tags.append(sector)
-        auto_tags.append(f"admiralty-scale:source-reliability={adm_src}")
-        auto_tags.append(f"admiralty-scale:information-credibility={adm_info}")
-        if args.tags:
-            auto_tags.extend(args.tags)
+        run_interactive(misp, args)
 
-    # Apply event-level tags
-    apply_event_tags(misp, event_uuid, list(dict.fromkeys(auto_tags)))  # dedupe preserving order
-
-    # CSV import
-    if args.csv:
-        mapping = load_mapping(args.mapping)
-        rows = read_csv_rows(args.csv)
-        if not rows:
-            print("CSV contained no rows, exiting.")
-            sys.exit(0)
-        print(f"Importing {len(rows)} rows into object template '{args.object}'")
-        # object-level tags to apply
-        obj_tags = args.tags[:] if args.tags else []
-        # add attribute-level admiralty tags if requested
-        if args.attr_admiralty:
-            obj_tags.append(f"admiralty-scale:source-reliability={args.attr_admiralty_src}")
-            obj_tags.append(f"admiralty-scale:information-credibility={args.attr_admiralty_info}")
-
-        added = 0
-        skipped = 0
-        for row in rows:
-            # If mapping contains 'ip' and we want to dedupe per-event, do a check
-            ip_col = None
-            for col, attr in mapping.items():
-                if attr == "ip":
-                    ip_col = col
-                    break
-            if ip_col:
-                val = row.get(ip_col) or row.get(ip_col.lower()) or row.get(ip_col.upper())
-                if val:
-                    # check duplicates for ip-dst and ip-src both if exists
-                    if attribute_exists_in_event(misp, event_id, val, "ip-dst") or attribute_exists_in_event(misp, event_id, val, "ip-src"):
-                        print(f"Skipping duplicate IP in event: {val}")
-                        skipped += 1
-                        continue
-            obj = add_object_from_row(misp, event_uuid, args.object, mapping, row)
-            if obj:
-                added += 1
-                # tag object
-                if obj_tags:
-                    apply_tags_to_object(misp, obj, obj_tags)
-                print(f"Added object uuid {obj['Object']['uuid']}")
-            else:
-                print("Failed to add object for row:", row)
-        print(f"CSV import complete. Added {added}, skipped {skipped}.")
-
-    # Publish if requested
-    if args.publish:
-        try:
-            misp.publish(event_id)
-            print(f"Event published: {misp_url}/events/view/{event_id}")
-        except Exception as e:
-            print("Publish failed:", e)
-    else:
-        print(f"Saved event (not published): {misp_url}/events/view/{event_id}")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nAborted by user.")
-        sys.exit(1)
+    main()
