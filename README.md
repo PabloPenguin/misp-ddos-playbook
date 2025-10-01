@@ -178,3 +178,6 @@ python ddos_playbook_cli.py --non-interactive --new-event --info "DDoS September
 MIT License (or your choice).
 
 ---
+
+## ❤️ Thanks
+If this helped, ⭐ star the repo and consider contributing improvements (additional object templates, more robust dedupe logic, richer enrichment hooks).

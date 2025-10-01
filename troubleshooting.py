@@ -1,28 +1,21 @@
-from pymisp import PyMISP
+import os, requests
 from dotenv import load_dotenv
-import os, json
-
-# Load credentials from .env
 load_dotenv()
+
 MISP_URL = os.getenv("MISP_URL")
 MISP_KEY = os.getenv("MISP_KEY")
 VERIFY = os.getenv("MISP_VERIFY_SSL", "false").lower() in ("1","true","yes")
 
-misp = PyMISP(MISP_URL, MISP_KEY, VERIFY)
+HEADERS = {
+    "Authorization": MISP_KEY,
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+}
 
-print("Fetching ALL galaxy clusters...")
-all_clusters = misp.search_galaxy_clusters("all")
+event_id = 1605
+cluster_value = "Network Denial of Service - T1498"
+tag = f'misp-galaxy:mitre-attack-pattern="{cluster_value}"'
 
-print(f"Total clusters fetched: {len(all_clusters)}")
-
-# Filter for T1498 and subs
-targets = [c for c in all_clusters if c.get("value", "").startswith("T1498")]
-print(f"Found {len(targets)} matching clusters:")
-
-for c in targets:
-    print(json.dumps({
-        "id": c.get("id"),
-        "uuid": c.get("uuid"),
-        "value": c.get("value"),
-        "description": c.get("description"),
-    }, indent=2))
+r = requests.post(f"{MISP_URL}/events/addTag/{event_id}",
+                  headers=HEADERS, json={"tag": tag}, verify=VERIFY)
+print(r.status_code, r.text)
